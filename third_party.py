@@ -1,5 +1,7 @@
 #!/usr/bin/env python
 # coding: utf-8
+# import pdb
+# from typing import Any, Optional
 
 # In[113]:
 import catboost
@@ -8,10 +10,14 @@ from sklearn.metrics import brier_score_loss, roc_auc_score, f1_score
 
 import numpy as np
 import pandas as pd
+
+# import pandera as pa
+# from pandera.typing import Series, DataFrame
 import tqdm
 import socceraction.atomic.vaep.formula as vaepformula
 import socceraction.vaep.features as fs
 import socceraction.vaep.labels as lab
+import SPADL_config as spadlconfig
 
 # third party in J League data
 
@@ -64,57 +70,38 @@ def create_features(spadl_h5, features_h5, labels_h5, games):
 # In[115]:
 
 
-def convert_J2spadl(J_eventdata):
+def convert_J2spadl(J_eventdata_df: pd.DataFrame) -> pd.DataFrame:
     # convert J data to spadl
     # input:play * 173 J feature
     # output:play * 25 spadl feature
-    spadl_feature = [
-        "game_id",
-        "period_id",
-        "time_seconds",
-        "start_frame",
-        "timestamp",
-        "team_id",
-        "player_id",
-        "start_x",
-        "start_y",
-        "end_x",
-        "end_y",
-        "type_id",
-        "result_id",
-        "bodypart_id",
-        "action_id",
-        "type_name",
-        "result_name",
-        "bodypart_name",
-        "player_name",
-        "player_nickname",
-        "jersey_number",
-        "country_id",
-        "country_name",
-        "extra",
-        "team_name",
-        "player",
-    ]
-    spadl_df = pd.DataFrame(columns=spadl_feature)
-    game_id = J_eventdata["試合ID"]
+
+    spadl_df = pd.DataFrame()
+    game_id = J_eventdata_df["試合ID"]
     game_len = len(game_id)
     # sort time sequence
-    J_eventdata = J_eventdata.sort_values("絶対時間秒数").reset_index(drop=True)
+    J_eventdata_df = J_eventdata_df.sort_values("絶対時間秒数").reset_index(drop=True)
 
-    secondhalf_index = J_eventdata.reset_index().query('アクション名=="後半開始"').index[0]
-    period_id = [1] * (secondhalf_index) + [2] * (game_len - secondhalf_index)
-    first_start_frame = J_eventdata.loc[0]["フレーム番号"]
-    first_end_frame = J_eventdata[J_eventdata["アクション名"] == "前半終了"].iloc[0]["フレーム番号"]
-    second_start_frame = J_eventdata.loc[secondhalf_index]["フレーム番号"]
-    start_frame = J_eventdata["フレーム番号"] - first_start_frame
-    start_frame[secondhalf_index:] = start_frame[secondhalf_index:] - (second_start_frame - first_end_frame)
-    min2sec = lambda x: (x % 100 + 60 * (x // 100))
-    time_seconds = list(map(min2sec, J_eventdata["ハーフ開始相対時間"]))
-    ball_x_change = lambda x: (x + 157.5) / 3
-    ball_y_change = lambda x: (x + 102) / 3
-    ball_x_changed = pd.Series(map(ball_x_change, J_eventdata["ボールＸ"]))
-    ball_y_changed = pd.Series(map(ball_y_change, J_eventdata["ボールＹ"]))
+    secondhalf_start_index = J_eventdata_df.reset_index().query('アクション名=="後半開始"').index[0]
+    period_id = [1] * (secondhalf_start_index) + [2] * (game_len - secondhalf_start_index)
+    first_start_frame = J_eventdata_df.loc[0, "フレーム番号"]
+    first_end_frame = J_eventdata_df[J_eventdata_df["アクション名"] == "前半終了"].iloc[0]["フレーム番号"]
+    second_start_frame = J_eventdata_df.loc[secondhalf_start_index]["フレーム番号"]
+    start_frame = J_eventdata_df["フレーム番号"] - first_start_frame
+    start_frame[secondhalf_start_index:] = start_frame[secondhalf_start_index:] - (second_start_frame - first_end_frame)
+
+    def min2sec(min: float) -> float:
+        return min % 100 + 60 * (min // 100)
+
+    time_seconds = list(map(min2sec, J_eventdata_df["ハーフ開始相対時間"]))
+
+    def ball_x_J2spadl(x: float) -> float:
+        return (x + 157.5) / 3
+
+    def ball_y_J2spadl(y: float) -> float:
+        return (y + 102) / 3
+
+    ball_x_changed = pd.Series(map(ball_x_J2spadl, J_eventdata_df["ボールＸ"]))
+    ball_y_changed = pd.Series(map(ball_y_J2spadl, J_eventdata_df["ボールＹ"]))
     start_x = ball_x_changed
     start_y = ball_y_changed
     end_x = ball_x_changed
@@ -122,102 +109,160 @@ def convert_J2spadl(J_eventdata):
     end_y = ball_y_changed
     end_y = end_y.shift(-1)
 
-    def type_idJ2spadl(x):
-        if x == 29 or x == 30 or x == 36 or x == 75:  # Pass
-            x = 0
-        elif x == 45:  # Cross
-            x = 1
-        elif x == 44:  # Throw-in
-            x = 2
-        elif x == 21:  # CK
-            x = 5
-        elif x == 35:  # Take on, J : drrible
-            x = 7
-        elif x == 27 or x == 38:  # Foul
-            x = 8
-        elif x == 74:  # Tackle
-            x = 9
-        elif x == 41:  # Interception
-            x = 10
-        elif x == 15:  # Shot
-            x = 11
-        elif x == 42:  # Clearance
-            x = 18
-        elif x == 50 or x == 73:  # Drrible
-            x = 21
-        elif x == 16:  # GK
-            x = 22
+    def _get_type_id(J_eventdata_df: pd.DataFrame) -> int:
+        type_name_J = J_eventdata_df["アクション名"]
+        type_name_spadl = "non_action"
+        if type_name_J.endswith("パス"):
+            type_name_spadl = "pass"  # default
+        elif (type_name_J == "キックオフ") or (type_name_J == "フィード"):
+            type_name_spadl = "pass"
+        elif type_name_J == "クロス":
+            type_name_spadl = "cross"
+        elif type_name_J == "スローイン":
+            type_name_spadl = "throw_in"
+        elif type_name_J == "CK":
+            type_name_spadl = "corner_crossed"
+        elif type_name_J == "PK":
+            type_name_spadl = "shot_penalty"
+        elif type_name_J == "GK":
+            type_name_spadl = "goalkick"
+        elif type_name_J == "ドリブル":
+            type_name_spadl = "take_on"
+        elif type_name_J == "ファウルする":
+            type_name_spadl = "foul"
+        elif type_name_J == "タックル":
+            type_name_spadl = "tackle"
+        elif type_name_J == "インターセプト":
+            type_name_spadl = "interception"
+        elif type_name_J == "シュート":
+            type_name_spadl = "shot"
+        elif (type_name_J == "直接FK") or (type_name_J == "間接FK"):
+            if J_eventdata_df["F_シュート"] == 1:
+                type_name_spadl = "shot_freekick"
+            else:
+                type_name_spadl = "freekick_crossed"
+        elif type_name_J == "オウンゴール":
+            type_name_spadl = "shot"
+        elif type_name_J == "キャッチ":
+            type_name_spadl = "keeper_save"
+        elif type_name_J == "ブロック":
+            if J_eventdata_df["ポジションID"] == 1:  # Goal Keeper
+                type_name_spadl = "keeper_save"
+            elif 2 <= J_eventdata_df["ポジションID"] <= 4:  # Field Player
+                type_name_spadl = "block"
+        elif type_name_J == "クリア":
+            type_name_spadl = "clearance"
+        elif type_name_J == "ハンドクリア":
+            type_name_spadl = "keeper_punch"
+        elif (type_name_J == "トラップ") or (type_name_J == "タッチ"):
+            type_name_spadl = "dribble"
         else:
-            x = -1
+            type_name_spadl = "non_action"
+        return spadlconfig.actiontypes.index(type_name_spadl)
 
-        return x
-
-    type_id = list(map(type_idJ2spadl, J_eventdata["アクションID"]))
-
-    def type_id2name(x):
-        if x == 0:
-            x = "pass"
-        elif x == 1:
-            x = "cross"
-        elif x == 2:
-            x = "throw_in"
-        elif x == 5:
-            x = "corner_crossed"
-        elif x == 7:
-            x = "take_on"
-        elif x == 8:
-            x = "foul"
-        elif x == 9:
-            x = "tackle"
-        elif x == 10:
-            x = "interception"
-        elif x == 11:
-            x = "shot"
-        elif x == 18:
-            x = "clearance"
-        elif x == 21:
-            x = "dribble"
-        elif x == 22:
-            x = "goalkick"
+    def _get_result_id(J_eventdata_df: pd.DataFrame) -> int:
+        type_name_J = J_eventdata_df["アクション名"]
+        A1_action_id_J = J_eventdata_df["A1_アクションID"]
+        A2_action_id_J = J_eventdata_df["A2_アクションID"]
+        result_name_spadl = "success"
+        if type_name_J == "オウンゴール":
+            result_name_spadl = "owngoal"
+        elif (type_name_J == "ファウルする") & (A2_action_id_J == 19):  # Yellow Card
+            result_name_spadl = "yellow_card"
+        elif (type_name_J == "ファウルする") & (A2_action_id_J == 24):  # Red Card
+            result_name_spadl = "red_card"
+        elif (type_name_J.endswith("パス")) & (A1_action_id_J == 23 or A2_action_id_J == 23):  # Offside
+            result_name_spadl = "offside"
+        elif (type_name_J == "クロス" or type_name_J == "フィード") & (
+            A1_action_id_J == 23 or A2_action_id_J == 23
+        ):  # Offside
+            result_name_spadl = "offside"
+        elif (type_name_J == "直接FK" or type_name_J == "間接FK") & (
+            A1_action_id_J == 23 or A2_action_id_J == 23
+        ):  # Offside
+            result_name_spadl = "offside"
+        elif (type_name_J == "シュート" or type_name_J == "クリア") & (
+            A1_action_id_J == 23 or A2_action_id_J == 23
+        ):  # Offside
+            result_name_spadl = "offside"
+        elif J_eventdata_df["F_成功"] == 0:
+            result_name_spadl = "fail"
         else:
-            x = "other"
-        return x
+            result_name_spadl = "success"
+        return spadlconfig.results.index(result_name_spadl)
 
-    type_name = list(map(type_id2name, type_id))
+    def _get_bodypart_id(J_eventdata_df: pd.DataFrame) -> int:
+        bodypart_id_J = J_eventdata_df["部位ID"]
+        bodypart_name_spadl = "foot"
+        if (bodypart_id_J == 0) | (bodypart_id_J == 1) | (bodypart_id_J == 2):
+            bodypart_name_spadl = "foot"
+        elif bodypart_id_J == 3:
+            bodypart_name_spadl = "head"
+        elif bodypart_id_J == 4:
+            bodypart_name_spadl = "other"
+        return spadlconfig.bodyparts.index(bodypart_name_spadl)
 
-    def result_id2name(x):
-        if x == 0:
-            x = "fail"
-        elif x == 1:
-            x = "success"
+    def add_names_jleague(spadl_df: pd.DataFrame) -> pd.DataFrame:
+        """Add the type name, result name and bodypart name to a SPADL dataframe.
+
+        Parameters
+        ----------
+        actions : pd.DataFrame
+            A SPADL dataframe.
+
+        Returns
+        -------
+        pd.DataFrame
+            The original dataframe with a 'type_name', 'result_name' and
+            'bodypart_name' appended.
+        """
+        return (
+            spadl_df.drop(
+                columns=["type_name", "result_name", "bodypart_name"],
+                errors="ignore",
+            )  # add timestamp
+            .merge(spadlconfig.actiontypes_df(), how="left")
+            .merge(spadlconfig.results_df(), how="left")
+            .merge(spadlconfig.bodyparts_df(), how="left")
+        )
+
+    def which_team_is_away(J_eventdata_df: pd.DataFrame) -> int:
+        home_or_away = J_eventdata_df["ホームアウェイF"]
+        team_id = J_eventdata_df["チームID"]
+        away_bool = 0
+        if (home_or_away == 1) & (team_id != 0):
+            away_bool = 0
+        elif (home_or_away == 2) & (team_id != 0):
+            away_bool = 1
         else:
-            x = "other"
-        return x
+            away_bool = -1
+        return away_bool
 
-    result_id = J_eventdata["F_成功"]
-    result_name = list(map(result_id2name, result_id))
     # set spadl feature
     spadl_df["game_id"] = game_id
     spadl_df["period_id"] = period_id
     spadl_df["time_seconds"] = time_seconds
     spadl_df["start_frame"] = start_frame
-    spadl_df["timestamp"] = J_eventdata["ハーフ開始相対時間"]
-    spadl_df["team_id"] = J_eventdata["チームID"]
-    spadl_df["player_id"] = J_eventdata["選手ID"]
+    spadl_df["timestamp"] = J_eventdata_df["ハーフ開始相対時間"]
+    spadl_df["team_id"] = J_eventdata_df["チームID"]
+    spadl_df["player_id"] = J_eventdata_df["選手ID"]
     spadl_df["start_x"] = start_x
     spadl_df["start_y"] = start_y
     spadl_df["end_x"] = end_x
     spadl_df["end_y"] = end_y
-    spadl_df["type_id"] = type_id
-    spadl_df["result_id"] = J_eventdata["F_成功"]
+    spadl_df["type_id"] = J_eventdata_df.apply(_get_type_id, axis=1)
+    spadl_df["result_id"] = J_eventdata_df.apply(_get_result_id, axis=1)
+    spadl_df["bodypart_id"] = J_eventdata_df.apply(_get_bodypart_id, axis=1)
+    spadl_df["away_team"] = J_eventdata_df.apply(which_team_is_away, axis=1)
     spadl_df["action_id"] = range(game_len)
-    spadl_df["type_name"] = type_name
-    spadl_df["result_name"] = result_name
-    spadl_df["player_name"] = J_eventdata["選手名"]
-    spadl_df["player_nickname"] = J_eventdata["選手名"]
-    spadl_df["jersey_number"] = J_eventdata["選手背番号"]
-    spadl_df["team_name"] = J_eventdata["チーム名"]
-    spadl_df["player"] = J_eventdata["選手名"]
+    spadl_df = add_names_jleague(spadl_df)
+    spadl_df["player_name"] = J_eventdata_df["選手名"]
+    spadl_df["jersey_number"] = J_eventdata_df["選手背番号"]
+    spadl_df["team_name"] = J_eventdata_df["チーム名"]
+    spadl_df["player"] = J_eventdata_df["選手名"]
+
+    spadl_needs = spadl_df.type_id != spadlconfig.actiontypes.index("non_action")
+    spadl_df = spadl_df[spadl_needs].reset_index(drop=True)
 
     return spadl_df
 
@@ -346,7 +391,8 @@ def estimate_vaep(models, X_test, Y_test, test_spadl):
         Y_hat_label[col] = np.where(Y_hat[col] > 0.5, 1, 0)
 
         # error handling in case Y_test not in True
-        if len(Y_test[Y_test[col] == True]) == 0:
+        # if len(Y_test[Y_test[col] == True]) == 0:
+        if len(Y_test[Y_test[col]]) == 0:
             continue
         else:
             print("{}".format(col))
@@ -368,7 +414,15 @@ def player_rating(spadl_df, values, player_data):
     # output
     # player_rating:player * 7
     player_rating = pd.DataFrame(
-        columns=["player_id", "team_id", "player", "vaep_value", "count", "minutes_played", "vaep_rating"]
+        columns=[
+            "player_id",
+            "team_id",
+            "player",
+            "vaep_value",
+            "count",
+            "minutes_played",
+            "vaep_rating",
+        ]
     )
     in_player = player_data[player_data.出場 == 1]
     player_id = in_player["選手ID"]
@@ -396,7 +450,7 @@ def player_rating(spadl_df, values, player_data):
 def convert_DMatrix(X_train, Y_train):
     # Convert DMatrix for XGBoost
     # input X_train, Y_train:score, concedes
-    event_num = len(Y_train["scores"])
+    # event_num = len(Y_train["scores"])
     # scores_weight = [len(Y_train[Y_train["scores"]==True]) / event_num , len(Y_train[Y_train["scores"]==False]) / event_num ]
     # concedes_weight = [len(Y_train[Y_train["concedes"]==True]) / event_num , len(Y_train[Y_train["concedes"]==False]) / event_num ]
 
